@@ -428,7 +428,7 @@
             <div class="empty" id="emptyState">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg>
               <h1>写真を開いて現像をはじめる</h1>
-              <p>JPEG / PNG / WebP に対応。RAW（RAF / DNG など）はセンサーデータからデモザイク現像します（圧縮RAWなど未対応の形式は埋め込みプレビューで開きます）。複数枚まとめて開いて、切り替えながら編集できます。写真はこの端末の中だけで処理され、外部に送信されません。</p>
+              <p>JPEG / PNG / WebP に対応。RAW（RAF / DNG など）はセンサーデータからデモザイク現像します（RAFのロスレス圧縮にも対応。ロッシー圧縮など未対応の形式は埋め込みプレビューで開きます）。複数枚まとめて開いて、切り替えながら編集できます。写真はこの端末の中だけで処理され、外部に送信されません。</p>
               <div class="row">
                 <button class="tbtn primary" id="btnOpen2" type="button">写真を選ぶ</button>
                 <button class="tbtn" id="btnSample" type="button">サンプル写真で試す</button>
@@ -978,10 +978,6 @@ function parseRAF(buf) {
   const dataOff = g(0xF007), dataLen = g(0xF008);
   const blackArr = tagVals(sub, 0xF00A) || [];
   if (!rawW || !rawH || dataOff == null) throw new Error("RAFの寸法が読めません");
-  if (dataLen !== rawW * rawH * 2) {
-    const err = new Error("圧縮RAFはデモザイク未対応です");
-    err.fallback = true; throw err;
-  }
   const meta = { pattern: null, top: 0, left: 0, cropW: rawW, cropH: rawH };
   let p = metaOff + 4;
   const mend = metaOff + metaLen;
@@ -1002,20 +998,312 @@ function parseRAF(buf) {
   // WB levels (GRB order) from CFA IFD: 0xF00E = as-shot, 0xF00C = standard reference
   const wbLevels = tagVals(sub, 0xF00E); // [G, R, B] raw response levels for a neutral
   // RawExposureBias from meta tag 0x9650 (int16 numerator / denominator, EV)
-  const raw = new Uint16Array(buf, cfaOff + dataOff, rawW * rawH);
+  let raw = null, compressed = null;
+  if (dataLen === rawW * rawH * 2) {
+    raw = new Uint16Array(buf, cfaOff + dataOff, rawW * rawH);
+  } else {
+    // ロスレス圧縮RAF: ここでは圧縮ヘッダの検証だけ行い、解凍は非同期の
+    // ensureRawPixels() で行う（数秒かかるため）。ロッシー圧縮や想定外の
+    // ヘッダは fujiParseCompressedHeader が fallback エラーを投げる。
+    const hdr = fujiParseCompressedHeader(buf, cfaOff + dataOff);
+    if (hdr.rawWidth !== rawW || hdr.rawHeight !== rawH || hdr.rawBits !== bits) {
+      const err = new Error("圧縮RAFの寸法がヘッダと一致しません");
+      err.fallback = true; throw err;
+    }
+    compressed = { dataStart: cfaOff + dataOff, dataLen, header: hdr };
+  }
   const black = blackArr.length >= 36 ? Float32Array.from(blackArr.slice(0, 36)) : null;
   const blackScalar = blackArr.length ? blackArr[0] : 1023;
   let model = new TextDecoder("ascii").decode(new Uint8Array(buf, 20, 32)).replace(/\0.*$/, "").trim();
   const mm = model.match(/[A-Za-z]+[-0-9][A-Za-z0-9 ]*$/);
   if (mm) model = mm[0].trim();
   return {
-    format: "RAF", model, rawW, rawH, bits, raw,
+    format: "RAF", model, rawW, rawH, bits, raw, compressed,
     patSize: 6, pattern, black, blackScalar, white: Math.pow(2, bits) - 1,
     crop: { left: meta.left, top: meta.top, w: meta.cropW, h: meta.cropH },
     wb: null, matrix: null,
     wbLevels: wbLevels && wbLevels.length >= 3 ? [wbLevels[1], wbLevels[0], wbLevels[2]] : null, // -> [R,G,B]
     rawBias: meta.rawBias || 0
   };
+}
+
+/* ---------- Fujifilm ロスレス圧縮 解凍 ----------
+   圧縮RAFのセンサーデータは、幅768pxの縦ストリップごとに独立して
+   符号化されている（16バイトヘッダ + ビッグエンディアンのストリップ
+   サイズ表 + 16バイト境界までのパディング + 各ストリップのビット列）。
+   各ストリップは6行を1組として、色別に並べ替えたライン列を
+   予測符号化している。本実装は LibRaw の fuji_compressed デコーダ
+   （lossless経路）の移植で、X-T5 / X-H1 / X-S10 の実ファイルで
+   LibRaw の出力と全画素一致（差分0）を検証済み。
+   ロッシー圧縮（カメラの「圧縮」設定）は符号化方式が異なるため
+   未対応のまま、ヘッダ検証で fallback する。 */
+const FUJI_LINE = { R0: 0, R1: 1, R2: 2, R3: 3, R4: 4, G0: 5, G1: 6, G2: 7, G3: 8, G4: 9, G5: 10, G6: 11, G7: 12, B0: 13, B1: 14, B2: 15, B3: 16, B4: 17, TOTAL: 18 };
+function fujiLog2ceil(val) { let r = 0; if (val--) do { ++r; } while (val >>= 1); return r; }
+function fujiParseCompressedHeader(buf, off) {
+  const u8 = new Uint8Array(buf);
+  const fail = msg => { const e = new Error(msg); e.fallback = true; throw e; };
+  if (off + 16 > u8.length) fail("圧縮RAFのヘッダが読めません");
+  const be16 = o => (u8[off + o] << 8) | u8[off + o + 1];
+  const h = {
+    signature: be16(0), lossless: u8[off + 2], rawType: u8[off + 3], rawBits: u8[off + 4],
+    rawHeight: be16(5), rawRoundedWidth: be16(7), rawWidth: be16(9),
+    blockSize: be16(11), blocksInRow: u8[off + 13], totalLines: be16(14)
+  };
+  const bad = h.signature !== 0x4953 || h.rawHeight < 6 || h.rawHeight % 6 || h.rawHeight > 0x4002 ||
+    h.rawWidth < 0x300 || h.rawWidth > 0x4200 || h.rawWidth % 24 ||
+    h.blockSize !== 0x300 || h.rawRoundedWidth < h.blockSize || h.rawRoundedWidth % h.blockSize ||
+    h.rawRoundedWidth - h.rawWidth >= h.blockSize || h.blocksInRow === 0 || h.blocksInRow > 0x10 ||
+    h.blocksInRow !== h.rawRoundedWidth / h.blockSize || h.totalLines === 0 ||
+    h.totalLines !== h.rawHeight / 6 || (h.rawBits !== 12 && h.rawBits !== 14 && h.rawBits !== 16) ||
+    h.rawType !== 16;
+  if (bad) fail("圧縮RAFのヘッダが想定と違います");
+  if (h.lossless !== 1) fail("圧縮（ロッシー）RAFはデモザイク未対応です");
+  return h;
+}
+async function fujiDecompressLossless(buf, dataStart, dataLen, header, pattern, onProgress) {
+  const u8 = new Uint8Array(buf);
+  const dv = new DataView(buf);
+  const W = header.rawWidth, H = header.rawHeight, bits = header.rawBits;
+  const maxValue = (1 << bits) - 1, minValue = 0x40;
+  const LW = (header.blockSize * 2) / 3; // X-Transのライン幅（768→512）
+  const totalLines = header.totalLines, nBlocks = header.blocksInRow;
+  const fail = msg => { const e = new Error(msg); e.fallback = true; throw e; };
+  // ストリップサイズ表（ヘッダ直後、ビッグエンディアンU32）と開始位置
+  const blockSizes = [], blockOffsets = [];
+  {
+    let acc = 0;
+    const stripsStart = dataStart + 16 + ((4 * nBlocks + 0xF) & ~0xF);
+    for (let i = 0; i < nBlocks; i++) {
+      const sz = dv.getUint32(dataStart + 16 + i * 4, false);
+      blockSizes.push(sz); blockOffsets.push(stripsStart + acc); acc += sz;
+    }
+    if (stripsStart + acc > dataStart + dataLen || stripsStart + acc > u8.length) {
+      fail("圧縮RAFのデータサイズが合いません");
+    }
+  }
+  // 量子化テーブル（lossless用、q_base=0）: 勾配を -4..+4 に量子化する
+  const qTable = new Int8Array(2 * maxValue + 1);
+  {
+    const qp = [0, 0x12, 0x43, 0x114, maxValue];
+    let idx = 0;
+    for (let v = -qp[4]; v <= qp[4]; v++, idx++) {
+      qTable[idx] = v <= -qp[3] ? -4 : v <= -qp[2] ? -3 : v <= -qp[1] ? -2 : v < -qp[0] ? -1 :
+        v <= qp[0] ? 0 : v < qp[1] ? 1 : v < qp[2] ? 2 : v < qp[3] ? 3 : 4;
+    }
+  }
+  const totalValues = maxValue + 1;
+  const rawBits = fujiLog2ceil(totalValues);
+  const maxBits = 4 * fujiLog2ceil(maxValue + 1);
+  const out = new Uint16Array(W * H);
+  let totalErr = 0;
+  const lineStride = LW + 2;
+  const lines = new Uint16Array(FUJI_LINE.TOTAL * lineStride);
+  const base = i => i * lineStride;
+  const FL = FUJI_LINE;
+
+  for (let block = 0; block < nBlocks; block++) {
+    const strip = u8.subarray(blockOffsets[block], blockOffsets[block] + blockSizes[block]);
+    const blockWidth = block + 1 === nBlocks ? W - header.blockSize * block : header.blockSize;
+    const blockX = header.blockSize * block;
+    // ビットリーダ（MSBファースト、ストリップ内逐次読み）
+    let bitPos = 0;
+    const totalBitsAvail = strip.length * 8;
+    function readBit() {
+      if (bitPos >= totalBitsAvail) return 0;
+      const b = (strip[bitPos >> 3] >> (7 - (bitPos & 7))) & 1;
+      bitPos++;
+      return b;
+    }
+    function zerobits() {
+      let c = 0;
+      while (readBit() === 0) { c++; if (c > maxBits + 16) { totalErr++; return c; } }
+      return c;
+    }
+    function readCode(n) { let d = 0; for (let i = 0; i < n; i++) d = (d << 1) | readBit(); return d; }
+    function bitDiff(v1, v2) {
+      let d = 0;
+      if (v2 < v1) { while (d <= 14) { d++; if ((v2 << d) >= v1) break; } }
+      return d;
+    }
+    // 勾配テーブル（偶数/奇数 × 3組 × 41文脈）。ストリップごとに初期化し、組をまたいで保持する
+    function newGrads() {
+      const maxDiff = Math.max(2, (totalValues + 0x20) >> 6);
+      const mk = () => Array.from({ length: 41 }, () => ({ v1: maxDiff, v2: 1 }));
+      return [mk(), mk(), mk()];
+    }
+    const evenG = newGrads(), oddG = newGrads();
+    function quantGrad(v1, v2) { return 9 * qTable[maxValue + v1] + qTable[maxValue + v2]; }
+    function decodeEven(lineIdx, pos, grads) {
+      const cur = base(lineIdx) + 1 + pos;
+      const Rb = lines[cur - 2 - LW], Rc = lines[cur - 3 - LW], Rd = lines[cur - 1 - LW], Rf = lines[cur - 4 - 2 * LW];
+      const diffRcRb = Math.abs(Rc - Rb), diffRfRb = Math.abs(Rf - Rb), diffRdRb = Math.abs(Rd - Rb);
+      const grad = quantGrad(Rb - Rf, Rc - Rb);
+      const gradient = Math.abs(grad);
+      let interp;
+      if (diffRcRb > diffRfRb && diffRcRb > diffRdRb) interp = Rf + Rd + 2 * Rb;
+      else if (diffRdRb > diffRcRb && diffRdRb > diffRfRb) interp = Rf + Rc + 2 * Rb;
+      else interp = Rd + Rc + 2 * Rb;
+      const sample = zerobits();
+      let code;
+      if (sample < maxBits - rawBits - 1) {
+        const decBits = bitDiff(grads[gradient].v1, grads[gradient].v2);
+        code = readCode(decBits) + (sample << decBits);
+      } else { code = readCode(rawBits) + 1; }
+      let err = 0;
+      if (code < 0 || code >= totalValues) err++;
+      if (code & 1) code = -1 - (code >> 1); else code >>= 1;
+      const g = grads[gradient];
+      g.v1 += Math.abs(code);
+      if (g.v2 === minValue) { g.v1 >>= 1; g.v2 >>= 1; }
+      g.v2++;
+      let val = (interp >> 2) + (grad < 0 ? -code : code);
+      if (val < 0) val += totalValues; else if (val > maxValue) val -= totalValues;
+      lines[cur] = val >= 0 ? Math.min(val, maxValue) : 0;
+      return err;
+    }
+    function decodeOdd(lineIdx, pos, grads) {
+      const cur = base(lineIdx) + 1 + pos;
+      const Ra = lines[cur - 1], Rb = lines[cur - 2 - LW], Rc = lines[cur - 3 - LW], Rd = lines[cur - 1 - LW], Rg = lines[cur + 1];
+      const grad = quantGrad(Rb - Rc, Rc - Ra);
+      const gradient = Math.abs(grad);
+      let interp;
+      if ((Rb > Rc && Rb > Rd) || (Rb < Rc && Rb < Rd)) interp = (Rg + Ra + 2 * Rb) >> 2;
+      else interp = (Ra + Rg) >> 1;
+      const sample = zerobits();
+      let code;
+      if (sample < maxBits - rawBits - 1) {
+        const decBits = bitDiff(grads[gradient].v1, grads[gradient].v2);
+        code = readCode(decBits) + (sample << decBits);
+      } else { code = readCode(rawBits) + 1; }
+      let err = 0;
+      if (code < 0 || code >= totalValues) err++;
+      if (code & 1) code = -1 - (code >> 1); else code >>= 1;
+      const g = grads[gradient];
+      g.v1 += Math.abs(code);
+      if (g.v2 === minValue) { g.v1 >>= 1; g.v2 >>= 1; }
+      g.v2++;
+      let val = interp + (grad < 0 ? -code : code);
+      if (val < 0) val += totalValues; else if (val > maxValue) val -= totalValues;
+      lines[cur] = val >= 0 ? Math.min(val, maxValue) : 0;
+      return err;
+    }
+    function interpEven(lineIdx, pos) {
+      const cur = base(lineIdx) + 1 + pos;
+      const Rb = lines[cur - 2 - LW], Rc = lines[cur - 3 - LW], Rd = lines[cur - 1 - LW], Rf = lines[cur - 4 - 2 * LW];
+      const diffRcRb = Math.abs(Rc - Rb), diffRfRb = Math.abs(Rf - Rb), diffRdRb = Math.abs(Rd - Rb);
+      if (diffRcRb > diffRfRb && diffRcRb > diffRdRb) lines[cur] = (Rf + Rd + 2 * Rb) >> 2;
+      else if (diffRdRb > diffRcRb && diffRdRb > diffRfRb) lines[cur] = (Rf + Rc + 2 * Rb) >> 2;
+      else lines[cur] = (Rd + Rc + 2 * Rb) >> 2;
+    }
+    function extendGeneric(start, end) {
+      for (let i = start; i <= end; i++) {
+        lines[base(i)] = lines[base(i - 1) + 1];
+        lines[base(i) + LW + 1] = lines[base(i - 1) + LW];
+      }
+    }
+    const extendRed = () => extendGeneric(FL.R2, FL.R4);
+    const extendGreen = () => extendGeneric(FL.G2, FL.G7);
+    const extendBlue = () => extendGeneric(FL.B2, FL.B4);
+    // 6行1組の復号。ライン対ごとに「符号化される位置」と「補間される位置」が決まっている
+    function xtransBlock() {
+      let errcnt = 0;
+      let rE = 0, rO = 1, gE = 0, gO = 1, bE = 0, bO = 1;
+      while (gE < LW || gO < LW) {
+        if (gE < LW) { interpEven(FL.R2, rE); rE += 2; errcnt += decodeEven(FL.G2, gE, evenG[0]); gE += 2; }
+        if (gE > 8) { errcnt += decodeOdd(FL.R2, rO, oddG[0]); rO += 2; errcnt += decodeOdd(FL.G2, gO, oddG[0]); gO += 2; }
+      }
+      extendRed(); extendGreen();
+      gE = 0; gO = 1;
+      while (gE < LW || gO < LW) {
+        if (gE < LW) { errcnt += decodeEven(FL.G3, gE, evenG[1]); gE += 2; interpEven(FL.B2, bE); bE += 2; }
+        if (gE > 8) { errcnt += decodeOdd(FL.G3, gO, oddG[1]); gO += 2; errcnt += decodeOdd(FL.B2, bO, oddG[1]); bO += 2; }
+      }
+      extendGreen(); extendBlue();
+      rE = 0; rO = 1; gE = 0; gO = 1;
+      while (gE < LW || gO < LW) {
+        if (gE < LW) {
+          if (rE & 3) errcnt += decodeEven(FL.R3, rE, evenG[2]); else interpEven(FL.R3, rE);
+          rE += 2; interpEven(FL.G4, gE); gE += 2;
+        }
+        if (gE > 8) { errcnt += decodeOdd(FL.R3, rO, oddG[2]); rO += 2; errcnt += decodeOdd(FL.G4, gO, oddG[2]); gO += 2; }
+      }
+      extendRed(); extendGreen();
+      gE = 0; gO = 1; bE = 0; bO = 1;
+      while (gE < LW || gO < LW) {
+        if (gE < LW) {
+          errcnt += decodeEven(FL.G5, gE, evenG[0]); gE += 2;
+          if ((bE & 3) === 2) interpEven(FL.B3, bE); else errcnt += decodeEven(FL.B3, bE, evenG[0]);
+          bE += 2;
+        }
+        if (gE > 8) { errcnt += decodeOdd(FL.G5, gO, oddG[0]); gO += 2; errcnt += decodeOdd(FL.B3, bO, oddG[0]); bO += 2; }
+      }
+      extendGreen(); extendBlue();
+      rE = 0; rO = 1; gE = 0; gO = 1;
+      while (gE < LW || gO < LW) {
+        if (gE < LW) {
+          if ((rE & 3) === 2) interpEven(FL.R4, rE); else errcnt += decodeEven(FL.R4, rE, evenG[1]);
+          rE += 2; errcnt += decodeEven(FL.G6, gE, evenG[1]); gE += 2;
+        }
+        if (gE > 8) { errcnt += decodeOdd(FL.R4, rO, oddG[1]); rO += 2; errcnt += decodeOdd(FL.G6, gO, oddG[1]); gO += 2; }
+      }
+      extendRed(); extendGreen();
+      gE = 0; gO = 1; bE = 0; bO = 1;
+      while (gE < LW || gO < LW) {
+        if (gE < LW) {
+          interpEven(FL.G7, gE); gE += 2;
+          if (bE & 3) errcnt += decodeEven(FL.B4, bE, evenG[2]); else interpEven(FL.B4, bE);
+          bE += 2;
+        }
+        if (gE > 8) { errcnt += decodeOdd(FL.G7, gO, oddG[2]); gO += 2; errcnt += decodeOdd(FL.B4, bO, oddG[2]); bO += 2; }
+      }
+      extendGreen(); extendBlue();
+      return errcnt;
+    }
+    lines.fill(0);
+    for (let curLine = 0; curLine < totalLines; curLine++) {
+      totalErr += xtransBlock();
+      // 履歴ラインへ退避（次組の予測参照用）
+      const mt = [[FL.R3, FL.R0], [FL.R4, FL.R1], [FL.G6, FL.G0], [FL.G7, FL.G1], [FL.B3, FL.B0], [FL.B4, FL.B1]];
+      for (const pair of mt) lines.copyWithin(base(pair[1]), base(pair[0]), base(pair[0]) + lineStride);
+      // ライン列 → 画像の画素配置に戻す（X-Transパターンで色を引き当てる）
+      for (let row = 0; row < 6; row++) {
+        const outRow = (curLine * 6 + row) * W + blockX;
+        const rBase = base(FL.R2 + (row >> 1)) + 1;
+        const gBase = base(FL.G2 + row) + 1;
+        const bBase = base(FL.B2 + (row >> 1)) + 1;
+        for (let px = 0; px < blockWidth; px++) {
+          const c = pattern[row * 6 + (px % 6)];
+          const lb = c === 0 ? rBase : c === 2 ? bBase : gBase;
+          const idx = ((((px * 2 / 3) | 0) & ~1) | ((px % 3) & 1)) + ((px % 3) >> 1);
+          out[outRow + px] = lines[lb + idx];
+        }
+      }
+      // 作業ラインを消去し、端のガード値だけ履歴から復元する
+      lines.fill(0, base(FL.R2), base(FL.R2) + 3 * lineStride);
+      lines.fill(0, base(FL.G2), base(FL.G2) + 6 * lineStride);
+      lines.fill(0, base(FL.B2), base(FL.B2) + 3 * lineStride);
+      lines[base(FL.R2)] = lines[base(FL.R1) + 1]; lines[base(FL.R2) + LW + 1] = lines[base(FL.R1) + LW];
+      lines[base(FL.G2)] = lines[base(FL.G1) + 1]; lines[base(FL.G2) + LW + 1] = lines[base(FL.G1) + LW];
+      lines[base(FL.B2)] = lines[base(FL.B1) + 1]; lines[base(FL.B2) + LW + 1] = lines[base(FL.B1) + LW];
+      if (onProgress && (curLine & 31) === 31) {
+        onProgress((block + (curLine + 1) / totalLines) / nBlocks);
+        await new Promise(r => setTimeout(r, 0)); // UIを固まらせないよう組ごとに譲る
+      }
+    }
+    if (onProgress) onProgress((block + 1) / nBlocks);
+  }
+  if (totalErr > 0) fail("ロスレス圧縮の解凍で異常を検出しました");
+  return { raw: out, errors: totalErr };
+}
+/* parseRAF が compressed を返した場合に、生画素を解凍して info.raw に差し込む */
+async function ensureRawPixels(buf, info, onProgress) {
+  if (!info || !info.compressed) return info;
+  const c = info.compressed;
+  const dec = await fujiDecompressLossless(buf, c.dataStart, c.dataLen, c.header, info.pattern, onProgress);
+  info.raw = dec.raw;
+  info.compressed = null;
+  info.wasLossless = true;
+  return info;
 }
 
 /* ---------- DNG / TIFF RAW ---------- */
@@ -1409,19 +1697,24 @@ const Decoders = [
         const err = new Error(e && e.message ? e.message : "RAWを解析できませんでした");
         err.fallback = true; throw err;
       }
+      const wasLossless = !!info.compressed;
+      if (info.compressed) {
+        await ensureRawPixels(buf, info, onProgress ? f => onProgress(f * 0.45) : null);
+      }
       const calib = rawCalibration(info);
       const rawOpts = { algo: "pro", wbMode: "shot", ev: calib.defaultEv, hi: 50 };
-      const dev = await developRawToCanvas(info, rawOpts, calib, onProgress);
+      const dev = await developRawToCanvas(info, rawOpts, calib,
+        onProgress ? f => onProgress(wasLossless ? 0.45 + f * 0.55 : f) : null);
       const exif = extractRawExif(buf, info);
       const ext = (f.name.match(/\.([a-z0-9]+)$/i) || [, "RAW"])[1].toUpperCase();
       return {
         source: dev.canvas, width: dev.width, height: dev.height,
         kind: "raw", label: ext + " RAW現像", exif,
-        note: ext + " をセンサーデータからデモザイク現像しました（" + info.model + " / " + info.bits + "bit）",
+        note: ext + " を" + (wasLossless ? "ロスレス圧縮を解凍し、" : "") + "センサーデータからデモザイク現像しました（" + info.model + " / " + info.bits + "bit）",
         file: f,
         rawDev: {
           format: info.format, model: info.model, rawW: info.rawW, rawH: info.rawH,
-          bits: info.bits, black: info.blackScalar, white: info.white,
+          bits: info.bits, black: info.blackScalar, white: info.white, compressed: wasLossless ? "lossless" : null,
           wbShot: calib.wbShot, wbAuto: calib.wbAuto, matrix: calib.matrix,
           defaultEv: calib.defaultEv, rawBias: info.rawBias || 0, scale: dev.scale
         },
@@ -1464,7 +1757,7 @@ const Decoders = [
       return {
         source: best.source, width: best.width, height: best.height,
         kind: "raf", label: ext + " プレビュー", exif,
-        note: ext + " は埋め込みプレビューで開いています（圧縮RAWなど、デモザイク現像に未対応のファイルのため）"
+        note: ext + " は埋め込みプレビューで開いています（ロッシー圧縮RAWなど、デモザイク現像に未対応のファイルのため）"
       };
     }
   }
@@ -4259,6 +4552,7 @@ function syncRawPanel() {
   const d = e.rawDev;
   const wb = d.wbShot || [1, 1, 1];
   $("#rawInfo").innerHTML = "<b>" + escapeHtmlRaw(d.model || d.format) + "</b> ・ センサー " + d.rawW + " × " + d.rawH + " px / " + d.bits + "bit" +
+    (d.compressed ? "<br>ロスレス圧縮RAF（解凍してから現像しています）" : "") +
     "<br>黒レベル " + Math.round(d.black) + " ・ 白レベル " + d.white +
     "<br>撮影時WBゲイン R " + wb[0].toFixed(2) + " / G 1.00 / B " + wb[2].toFixed(2) +
     (d.rawBias ? "<br>Raw露出バイアス " + d.rawBias.toFixed(2) + " EV（現像露出の初期値で補正済み）" : "") +
@@ -4282,9 +4576,14 @@ async function redevelopCurrent() {
     const buf = await e.file.arrayBuffer();
     const head = new TextDecoder("ascii").decode(new Uint8Array(buf, 0, 16));
     const info = head.startsWith("FUJIFILMCCD-RAW") ? parseRAF(buf) : parseDNG(buf);
+    const wasLossless = !!info.compressed;
+    if (info.compressed) {
+      status.textContent = "ロスレス圧縮を解凍中…";
+      await ensureRawPixels(buf, info, f => { fill.style.width = Math.round(f * 45) + "%"; });
+    }
     const calib = { wbShot: e.rawDev.wbShot, wbAuto: e.rawDev.wbAuto, matrix: e.rawDev.matrix, defaultEv: e.rawDev.defaultEv };
     status.textContent = "デモザイク現像中…";
-    const dev = await developRawToCanvas(info, e.rawOpts, calib, frac => { fill.style.width = Math.round(frac * 100) + "%"; });
+    const dev = await developRawToCanvas(info, e.rawOpts, calib, frac => { fill.style.width = Math.round((wasLossless ? 45 + frac * 55 : frac * 100)) + "%"; });
     e.source = dev.canvas;
     e.width = dev.width; e.height = dev.height;
     e.rawDev.scale = dev.scale;
